@@ -62,29 +62,93 @@ Boom 2 在 macOS 上能"系统级"工作，是因为 macOS 允许用户态安装
 ## 它做什么
 
 `CaptureService` 用 `AudioPlaybackCapture` 抓 `USAGE_MEDIA|GAME|UNKNOWN` 的音频，
-在音频线程上算 RMS/峰值，并可选择把抓到的 PCM **原样**写回 `AudioTrack`。
-"原样写回"是刻意的——它让站在手机前的人直接用耳朵判断源音频有没有被静音、有没有双声。
+经过 Rust DSP，再写回 `AudioTrack`。整条链现在是可以出声的完整方案：
 
-界面只有三个控件，对应三个实验：
+```
+AudioPlaybackCapture ──► Engine::process_i16 ──► AudioTrack(STREAM_ALARM)
+                          ├─ 10 段 biquad EQ（RBJ cookbook）
+                          ├─ 输出增益（一阶平滑，避免 zipper noise）
+                          └─ 2ms 前瞻限幅器 + 软削波
+```
 
-- **1. 授权并开始抓取** — 大字状态显示判定结果
-- **2. 回放开关** — 直通回放，用来听回声
-- **停止**
+六个控件：
 
-## 判读表
+| # | 控件 | 作用 |
+|---|---|---|
+| 1 | 授权并开始抓取 | 申请 MediaProjection + RECORD_AUDIO，起前台服务 |
+| 2 | 回放 | 把处理后的音频送出去 |
+| 3 | 输出 | 在 `STREAM_MUSIC` / `STREAM_ALARM` / `STREAM_SYSTEM` 之间循环 |
+| 4 | 静音原声 | 把 `STREAM_MUSIC` 压到 0，掐掉源 app 的外放 |
+| 5 | DSP | 在 5 条曲线之间循环，按钮下方显示当前曲线的意图 |
+| — | 停止 | 结束并**强制恢复媒体音量**，不留后患 |
 
-先开 Apple Music / B 站**播放音乐**，再点开始抓取。
+大字状态：绿色 `有信号 -xx dBFS` = 抓到了；红色 `静音 · 抓不到` = 该 app 屏蔽了捕获。
 
-| 观察 | 结论 |
-|---|---|
-| 大字绿色 `有信号 -xx dBFS` | 抓到了，路线成立 |
-| 大字红色 `静音 · 抓不到`，frames 在涨但 silent 接近 100% | 该 app 屏蔽了捕获 → 它在这个方案里用不了 |
-| 回放**关**着，你仍然能听到音乐 | 源音频没被静音 → 开回放必然双声 |
-| 回放**关**着，音乐停了/明显变小 | 系统把源音频让给了捕获流（最理想） |
-| 回放开着，听到回声/加倍/梳状滤波 | 双声确认，需要额外的"静音原声"处理 |
-| `added delay` 数值 | 低于 ~50ms 可忽略；超过 ~100ms 视频口型会不同步 |
+## 为什么输出必须走 STREAM_ALARM
 
-底部详情区里 `out lag` 由 `AudioTrack.getTimestamp()` 算出，是输出缓冲落后真实时间的量。
+`AudioPlaybackCapture` 的语义是**复制**——源 app 照常播到扬声器，我们额外拿到一份。
+不处理就是双声 + 梳状滤波（实测：43ms 时鼓点明显错开；4ms 时变成发闷、鼓点被增强）。
+
+解法是掐掉源外放。**捕获点在音量缩放之前**，所以把 `STREAM_MUSIC` 压到 0 只影响外放、
+不影响我们拿到的数据（实测 `vol=0` 时捕获仍是 −28 dBFS，`verdict` 仍是 SIGNAL）。
+
+但这样我们自己的输出也会被一起静音——它默认也在 `STREAM_MUSIC` 上。所以输出改走
+`STREAM_ALARM`：它是这台机器上唯一「独立于 `STREAM_MUSIC` + 未被静音 + 不在捕获
+usage 列表里」的流。**这是测试落脚点，不是产品方案**（见上文「产品化的四个硬问题」）。
+
+## DSP 内核
+
+Rust 写的实时音频处理，通过 JNI 挂在抓取和重放之间。**曲线定义、滤波器、限幅器全在 Rust**，
+Kotlin 只保留 UI 需要的名字和说明——把它们放在 DSP 旁边，是为了能用测试量出真实频响，
+而不是在注释里声称。
+
+### RT 安全的做法
+
+- **音频路径上零分配、零锁。** 参数存在原子量里（UI 线程写、音频线程读），系数只在版本号
+  变化时重算，且重算时保留滤波器状态——否则每次调参都会爆一声。
+- **`nativeProcess` 带长度参数。** `AudioRecord.read()` 返回的是实际读到的数量，缓冲区通常
+  比里面的音频长。不带长度就会把陈旧样本也送进处理链；而在音频线程上 `copyOf` 分配内存
+  同样不可接受，所以只有这一个办法。
+- **`panic = "abort"`。** 跨 FFI 边界 unwind 是未定义行为，音频插件宁可确定性崩溃。
+- **`AudioTrack` 由音频线程独占。** 详见「已知的坑」里那条竞态。
+
+### 频响（实测，不是声称）
+
+```sh
+cargo test --manifest-path rust/Cargo.toml print_response_table -- --nocapture
+```
+
+| Hz | 关 | 突出人声 | 突出背景 | 温和 | 强 |
+|---|---|---|---|---|---|
+| 60 | 0.0 | −2.9 | **+6.0** | +2.6 | +6.0 |
+| 250 | 0.0 | −2.8 | +0.5 | −0.4 | −1.4 |
+| 1000 | 0.0 | +2.6 | **−6.0** | +0.1 | +0.1 |
+| 1600 | 0.0 | **+5.3** | **−4.8** | +1.0 | +2.4 |
+| 2500 | 0.0 | **+5.8** | −0.8 | +2.0 | +5.1 |
+| 14000 | 0.0 | +1.9 | +5.1 | +1.8 | +4.6 |
+
+**所有预设的输出增益统一为 0 dB。** 早先的版本一条 +2 dB、一条 +5 dB，结果唯一能听出来的
+只有音量差——更响几乎自动被读成"更好"，把真正要测的音色变化盖掉了。这也让"温和 vs 强"
+这种同形状只差程度的对比变得几乎无意义。
+
+### 测试抓到的真 bug
+
+1. **立体声共用滤波器状态。** 每帧用同一条 biquad 链处理左右声道时，滤波器看到的是
+   96 kHz 的 L,R,L,R 交错流，按 48 kHz 设计的 1000 Hz 中心频率实际落在 500 Hz 上——
+   整个 EQ 失谐（+12 dB 的提升只测到 +4 dB）。`stereo_channels_are_independent` 锁死它。
+2. **限幅器延迟差一个采样。** 延迟线 `la` 个槽位时最老的可用样本是 `input[i-la+1]`，
+   实际延迟是 `la-1`，而 `latency_frames()` 报的是 `la`。听不出来，但报了就该报准。
+3. **参数变化重置滤波器状态**导致爆音——改为 `replace_coefficients`：只换系数，保留 z1/z2。
+
+这三个都不是调出来的，是测试逼出来的。
+
+### 已知限制
+
+- **静态 EQ 无法分离人声和伴奏。** 它们在同一频段，滤波器不知道哪个是哪个。"突出人声"
+  的真实含义是"中频前倾"。要真正让人声压过伴奏需要动态处理（1–4 kHz 的向上压缩或动态
+  EQ），那是下一个模块，不是调参数能解决的。
+- **没有响度归一化。** 源素材峰值约 −11 dBFS，还有约 10 dB 余量，所以限幅器几乎不介入
+  （GR 读数常为 0.0 dB）。这意味着 Boom 的 "Volume Boost" 卖点我们一点都没实现。
 
 ## 构建
 
@@ -111,22 +175,34 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - Android 14+ 要求 **先** `startForeground()` 带 `mediaProjection` 类型，**再** `getMediaProjection()`。
 - Android 14+ 必须先 `registerCallback()`，否则 `MediaProjection` 会抛异常。
 - `MediaProjection` 没有活跃捕获时可能被回收，所以建了个 16×16 的 `VirtualDisplay` 吊着它。
+- **`AudioTrack` 不能在 UI 线程释放。** 采集线程手里握着 `track` 引用、正要 `write`，UI 线程
+  把它 `release` 掉，就是一次 use-after-release——`play()` 会抛
+  `IllegalStateException: Unable to retrieve AudioTrack pointer`。在非主线程抛异常直接杀进程。
+  这个窗口本来就有，但把 DSP 调用插进"取引用"和"写"之间以后，它从极难触发变成了几乎必中。
+  修法是让**音频线程独占 `track`**：UI 只投递请求（`pendingRoute` / `pendingPlayback`），
+  音频线程在每块开头执行。
+- **AGP 9 的 Gradle daemon 找不到 `cargo`。** daemon 继承的是它启动时的 PATH，几乎不含
+  `~/.cargo/bin`。要按路径解析 cargo，并把它的目录加进 `PATH`——`cargo ndk` 是靠搜索 PATH
+  找 `cargo-ndk` 子命令的。
+- **Gradle Kotlin 脚本里的 `java` 不是包名**，是 Java 插件扩展。`java.util.Properties` 会报
+  "Unresolved reference 'util'"，得 `import java.util.Properties`。
 
-## 下一步（取决于 probe 结果）
+## 下一步
 
-- 抓不到 → 只剩 root 路线（Magisk + AudioFlinger effect），整个项目形态要重估
-- 有双声 → 研究"静音原声"的绕法（不能用 `STREAM_MUSIC` 静音，会连自己的输出一起杀掉）
-- 延迟过高 → B 站视频场景放弃，只做纯音乐场景
-- 都通过 → 进入 `/to-spec` → `/to-tickets` → `/implement`，开始写 Rust DSP 内核
+已完成：可行性验证、完整音频链、基础 DSP（10 段 EQ + 限幅器）。
 
-DSP 内核的目标清单（对标 Boom 的各项卖点）：
+按 Boom 的卖点清单，还没做：
 
-| 模块 | 原理 | 对标 |
-|---|---|---|
-| 参量均衡 | biquad IIR，RBJ cookbook 系数 | 31 段 EQ |
-| 虚拟低音 | 缺失基频重建（谐波生成） | Bass boost |
-| 立体声展宽 | mid/side 处理 | Stereo widening |
-| 交叉馈送/HRTF | 串扰 + 头部传递函数 | 3D Surround |
-| 压缩 + 限幅 | 提升音量后防削顶 | Volume Boost |
-| 响度归一化 | ITU-R BS.1770 / ReplayGain | — |
-| 卷积混响 | IR 卷积 | Ambience / Night Mode |
+| 模块 | 原理 | 对标 | 状态 |
+|---|---|---|---|
+| 参量均衡 | biquad IIR，RBJ cookbook | 31 段 EQ | ✅ 10 段 |
+| 压缩 + 限幅 | 提升音量后防削顶 | Volume Boost | ⚠️ 限幅有，但没有补偿增益 |
+| 响度归一化 | ITU-R BS.1770 / ReplayGain | — | ❌ |
+| **动态 EQ / 多段压缩** | 按频段做向上压缩 | 人声突出 | ❌ 静态 EQ 的天花板在这 |
+| 虚拟低音 | 缺失基频重建（谐波生成） | Bass boost | ❌ |
+| 立体声展宽 | mid/side 处理 | Stereo widening | ❌ |
+| 交叉馈送 / HRTF | 串扰 + 头部传递函数 | 3D Surround | ❌ |
+| 卷积混响 | IR 卷积 | Ambience / Night Mode | ❌ |
+
+以及那些「产品化的四个硬问题」——尤其自动检测连续静音来解除媒体流静音（否则屏蔽捕获的
+app 会变成哑巴）。

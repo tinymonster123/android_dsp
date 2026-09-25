@@ -25,6 +25,8 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Process
 import android.util.Log
+import com.fenghanli.dspprobe.dsp.DspEngine
+import com.fenghanli.dspprobe.dsp.Presets
 import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlin.math.log10
@@ -39,6 +41,9 @@ class CaptureService : Service() {
 
     companion object {
         private const val TAG = "DspProbe"
+
+        /** Marker for "the UI thread has not asked for a change". */
+        private const val NO_PENDING = -1
 
         private const val ACTION_START = "com.fenghanli.dspprobe.START"
         private const val ACTION_STOP = "com.fenghanli.dspprobe.STOP"
@@ -75,6 +80,7 @@ class CaptureService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var record: AudioRecord? = null
     private var track: AudioTrack? = null
+    private var dsp: DspEngine? = null
 
     /**
      * Reused by the audio thread to read the output device's presentation clock.
@@ -89,6 +95,28 @@ class CaptureService : Service() {
     private var loopRunning = false
     private var worker: Thread? = null
     private var tearingDown = false
+
+    /**
+     * Requests from the UI thread, realised by the audio thread.
+     *
+     * These exist because the track used to be paused, released and rebuilt from
+     * the UI thread while the capture thread was midway through
+     * `AudioTrack.write`. That is a use-after-release: the write throws on a
+     * non-main thread and takes the whole process down. Widening the window
+     * (by calling into the DSP between taking the track and writing to it) is
+     * what turned it from rare into reliable.
+     *
+     * Handing ownership to the one thread that actually uses the track removes
+     * the race rather than narrowing it. The cost is that rebuilding an
+     * AudioTrack allocates on the audio thread, once per button press — a
+     * one-off glitch on an explicit user action, which is the right trade
+     * against an intermittently fatal race.
+     */
+    @Volatile
+    private var pendingRoute: Int = NO_PENDING
+
+    @Volatile
+    private var pendingPlayback: Int = NO_PENDING
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -233,7 +261,59 @@ class CaptureService : Service() {
         // The system may hand back a different format than we asked for; report what we got.
         ProbeState.captureSampleRate = rec.sampleRate
         ProbeState.captureChannels = rec.channelCount
+
+        // The DSP core is tied to the capture format rather than the output
+        // track, so it is rebuilt here whenever a fresh record is opened.
+        dsp?.close()
+        val engine = DspEngine(rec.sampleRate, rec.channelCount)
+        dsp = engine
+        if (engine.isValid) {
+            applyPreset(engine, ProbeState.presetIndex, rec.sampleRate)
+            // The curve table lives in Rust and the name table in Kotlin; this is
+            // the only place both are reachable at once.
+            if (!Presets.namesMatchNative()) {
+                ProbeState.note =
+                    "预设表不一致：Kotlin ${Presets.count()} 条 vs native ${DspEngine.presetCount} 条"
+            }
+        } else {
+            ProbeState.note = "DSP 引擎创建失败（libdsp.so 没加载上？）"
+        }
         return true
+    }
+
+    /**
+     * Hands the curve index to the native engine and publishes what the UI shows.
+     *
+     * Index 0 is a true bypass on the Rust side — no EQ *and* no limiter latency —
+     * so an A/B against it compares the DSP to nothing at all, rather than to a
+     * re-levelled signal.
+     */
+    private fun applyPreset(engine: DspEngine, index: Int, sampleRate: Int) {
+        val idx = index.coerceIn(0, Presets.count() - 1)
+        engine.applyPreset(idx)
+        val info = Presets.infoAt(idx)
+        ProbeState.presetIndex = idx
+        ProbeState.presetName = info.name
+        ProbeState.presetIntent = info.intent
+        ProbeState.dspLatencyMs = if (idx == 0) 0f else engine.latencyFrames * 1000f / sampleRate
+        ProbeState.dspReductionDb = 0f
+    }
+
+    /** Called from the UI thread. */
+    fun setPreset(index: Int) {
+        val idx = index.coerceIn(0, Presets.count() - 1)
+        val engine = dsp
+        if (engine == null) {
+            // No capture running, so no engine and no sample rate. Record the
+            // choice; openInput() will apply it when a record is opened.
+            val info = Presets.infoAt(idx)
+            ProbeState.presetIndex = idx
+            ProbeState.presetName = info.name
+            ProbeState.presetIntent = info.intent
+            return
+        }
+        applyPreset(engine, idx, record?.sampleRate ?: 48000)
+        ProbeState.note = "DSP 预设：${Presets.infoAt(idx).name}"
     }
 
     /**
@@ -316,9 +396,30 @@ class CaptureService : Service() {
         ProbeState.outputPolicy = -1
     }
 
-    /** Called from the UI thread when the user flips the playback switch. */
+    /** Called from the UI thread. Only records the intent; see [pendingPlayback]. */
     fun setPlayback(on: Boolean) {
         ProbeState.playing = on
+        if (loopRunning) {
+            pendingPlayback = if (on) 1 else 0
+        } else {
+            // No capture thread to race with.
+            realizePlayback(on)
+        }
+    }
+
+    /** Called from the UI thread. Only records the intent; see [pendingRoute]. */
+    fun cycleOutputRoute() {
+        val next = (ProbeState.outputRoute + 1) % 3
+        ProbeState.outputRoute = next
+        if (loopRunning) {
+            pendingRoute = next
+        } else {
+            realizeRoute(next)
+        }
+    }
+
+    /** Audio thread (or a stopped service): actually start/stop the output track. */
+    private fun realizePlayback(on: Boolean) {
         val t = track ?: return
         try {
             if (on) {
@@ -327,22 +428,43 @@ class CaptureService : Service() {
                 if (t.playState == AudioTrack.PLAYSTATE_PLAYING) t.pause()
                 t.flush()
             }
-        } catch (t2: Throwable) {
-            ProbeState.note = "切换回放失败: ${t2.javaClass.simpleName}"
+        } catch (e: Throwable) {
+            ProbeState.note = "切换回放失败: ${e.javaClass.simpleName}"
         }
     }
 
-    /** Cycle MUSIC -> ALARM -> SYSTEM without restarting capture. */
-    fun cycleOutputRoute() {
+    /** Audio thread (or a stopped service): rebuild the output track on a new route. */
+    private fun realizeRoute(route: Int) {
         val wasPlaying = ProbeState.playing
-        ProbeState.outputRoute = (ProbeState.outputRoute + 1) % 3
         releaseTrack()
-        // Deliberately no note write here: openOutput's failure message would be lost.
-        val failure = ProbeState.note
+        // Blank the note so openOutput's failure message, if any, is not lost.
         ProbeState.note = ""
         openOutput()
-        if (ProbeState.note.isEmpty()) ProbeState.note = failure
-        if (wasPlaying) setPlayback(true)
+        val failure = ProbeState.note
+        if (failure.isNotEmpty()) {
+            ProbeState.note = failure
+            return
+        }
+        if (wasPlaying) realizePlayback(true)
+        ProbeState.note = "输出已切到 ${ProbeState.routeName(route)}"
+    }
+
+    /**
+     * Applies anything the UI thread asked for. Runs at the top of every capture
+     * block, before the track is touched, so the track is never swapped out from
+     * under an in-flight write.
+     */
+    private fun applyPendingControls() {
+        val route = pendingRoute
+        if (route != NO_PENDING) {
+            pendingRoute = NO_PENDING
+            realizeRoute(route)
+        }
+        val playback = pendingPlayback
+        if (playback != NO_PENDING) {
+            pendingPlayback = NO_PENDING
+            realizePlayback(playback == 1)
+        }
     }
 
     /**
@@ -407,6 +529,10 @@ class CaptureService : Service() {
             var iteration = 0
 
             while (loopRunning) {
+                // Before anything else: the audio thread owns the track, so this
+                // is the only place it may be swapped.
+                applyPendingControls()
+
                 val n = rec.read(buf, 0, buf.size)
                 if (n <= 0) {
                     ProbeState.readErrors++
@@ -459,13 +585,19 @@ class CaptureService : Service() {
                 val t = track
                 if (t != null && ProbeState.playing) {
                     if (t.playState != AudioTrack.PLAYSTATE_PLAYING) t.play()
+                    // Process in place, then hand the very same array to the track:
+                    // no allocation, no second copy, on the audio thread.
+                    dsp?.process(buf, n)
                     val written = t.write(buf, 0, n)
                     if (written < 0) ProbeState.trackUnderruns++
-                    if (iteration % 20 == 0 && t.getTimestamp(outputTimestamp)) {
-                        // nanoTime is on the same monotonic clock as System.nanoTime(), so this
-                        // is how long ago the currently-presented frame reached the device.
-                        ProbeState.trackLatencyMs =
-                            ((System.nanoTime() - outputTimestamp.nanoTime) / 1_000_000L).toInt()
+                    if (iteration % 20 == 0) {
+                        ProbeState.dspReductionDb = dsp?.reductionDb ?: 0f
+                        if (t.getTimestamp(outputTimestamp)) {
+                            // nanoTime is on the same monotonic clock as System.nanoTime(),
+                            // so this is how long ago the presented frame reached the device.
+                            ProbeState.trackLatencyMs =
+                                ((System.nanoTime() - outputTimestamp.nanoTime) / 1_000_000L).toInt()
+                        }
                     }
                 }
                 iteration++
@@ -509,6 +641,11 @@ class CaptureService : Service() {
         worker = null
 
         releaseTrack()
+
+        dsp?.close()
+        dsp = null
+        ProbeState.dspReductionDb = 0f
+
         record?.release()
         record = null
 

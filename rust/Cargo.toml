@@ -1,0 +1,24 @@
+[package]
+name = "dsp"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time audio DSP core for android_dsp"
+
+[lib]
+name = "dsp"
+# rlib as well as cdylib: cdylib is what ships in the APK, rlib is what lets
+# `cargo test` build the unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "0.21"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+# The audio thread must never unwind into the JVM.
+overflow-checks = false
+debug-assertions = false

@@ -19,6 +19,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.fenghanli.dspprobe.dsp.Presets
 
 class MainActivity : Activity() {
 
@@ -34,6 +35,8 @@ class MainActivity : Activity() {
     private lateinit var playbackBtn: Button
     private lateinit var routeBtn: Button
     private lateinit var muteBtn: Button
+    private lateinit var presetBtn: Button
+    private lateinit var presetInfoText: TextView
 
     private val ui = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
@@ -110,6 +113,23 @@ class MainActivity : Activity() {
         }
         root.addView(muteBtn, matchWidth())
 
+        presetBtn = Button(this).apply {
+            setOnClickListener {
+                service()?.setPreset((ProbeState.presetIndex + 1) % Presets.count())
+            }
+        }
+        root.addView(presetBtn, matchWidth())
+
+        // Shown under the buttons rather than buried in the readout: during an A/B
+        // you need to know what the current curve is *supposed* to sound like.
+        presetInfoText = TextView(this).apply {
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#555555"))
+            setPadding(0, 0, 0, dp(6))
+        }
+        root.addView(presetInfoText, matchWidth())
+
         stopBtn = Button(this).apply {
             text = "停止"
             setOnClickListener {
@@ -149,12 +169,15 @@ class MainActivity : Activity() {
         playbackBtn.isEnabled = ProbeState.running
         routeBtn.isEnabled = ProbeState.running
         muteBtn.isEnabled = ProbeState.running
+        presetBtn.isEnabled = ProbeState.running
 
         playbackBtn.text =
             if (ProbeState.playing) "2. 回放：开（听有没有回声）" else "2. 回放：关（听原声还在不在）"
         routeBtn.text = "3. 输出：${ProbeState.routeName(ProbeState.outputRoute)}（点一下换一条）"
         muteBtn.text =
             if (ProbeState.muteOriginal) "4. 静音原声：开（只剩我们一路）" else "4. 静音原声：关"
+        presetBtn.text = "5. DSP：${ProbeState.presetName}（点一下换）"
+        presetInfoText.text = ProbeState.presetIntent
 
         when (ProbeState.verdict()) {
             ProbeState.Verdict.IDLE -> {
