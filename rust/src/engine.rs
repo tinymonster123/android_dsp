@@ -52,7 +52,11 @@ pub struct Params {
     output_gain_db: AtomicU32,
     threshold_db: AtomicU32,
     virtual_bass: AtomicU32,
-    enabled: AtomicBool,
+    /// Whether the EQ is doing anything at all. Cleared by the flat preset.
+    ///
+    /// Not a master switch — the virtual bass has its own, and the chain runs
+    /// while either of them has work to do. See [`Engine::process_i16`].
+    eq_enabled: AtomicBool,
 }
 
 impl Params {
@@ -66,7 +70,7 @@ impl Params {
             // `-(1.0f32.to_bits())`, i.e. unary minus on a u32.
             threshold_db: AtomicU32::new((-1.0f32).to_bits()),
             virtual_bass: AtomicU32::new(0.0f32.to_bits()),
-            enabled: AtomicBool::new(true),
+            eq_enabled: AtomicBool::new(true),
         }
     }
 
@@ -107,9 +111,23 @@ impl Params {
         self.bump();
     }
 
-    pub fn set_enabled(&self, on: bool) {
-        self.enabled.store(on, Ordering::Relaxed);
+    /// Turns the EQ off without touching the virtual bass.
+    ///
+    /// Callers clearing this are expected to have flattened the bands already —
+    /// [`crate::presets::apply`] does. [`Engine::refresh`] flattens them anyway, so
+    /// that "the EQ is disabled" means the EQ is transparent rather than meaning it
+    /// happens to be holding a flat curve.
+    pub fn set_eq_enabled(&self, on: bool) {
+        self.eq_enabled.store(on, Ordering::Relaxed);
         self.bump();
+    }
+
+    fn eq_enabled(&self) -> bool {
+        self.eq_enabled.load(Ordering::Relaxed)
+    }
+
+    fn virtual_bass_amount(&self) -> f32 {
+        f32::from_bits(self.virtual_bass.load(Ordering::Relaxed))
     }
 }
 
@@ -136,7 +154,6 @@ pub struct Engine {
     smooth_gain: f32,
     target_gain: f32,
     gain_coef: f32,
-    enabled: bool,
 }
 
 impl Engine {
@@ -155,7 +172,6 @@ impl Engine {
             smooth_gain: 1.0,
             target_gain: 1.0,
             gain_coef: (-2.0 * std::f32::consts::PI * GAIN_SMOOTH_HZ / sample_rate).exp(),
-            enabled: true,
         }
     }
 
@@ -163,8 +179,23 @@ impl Engine {
         self.channels
     }
 
+    /// Whether the chain has anything to do.
+    ///
+    /// Read from the parameters rather than a refreshed cache so that
+    /// [`Engine::latency_frames`] is right even before the first block, and so the
+    /// bypass and the reported latency are decided by the same expression and
+    /// cannot drift apart.
+    fn chain_is_active(&self) -> bool {
+        self.params.eq_enabled() || self.params.virtual_bass_amount() > 0.0
+    }
+
+    /// Latency the chain adds, in frames. Zero when nothing is being processed.
     pub fn latency_frames(&self) -> usize {
-        self.limiter.latency_frames()
+        if self.chain_is_active() {
+            self.limiter.latency_frames()
+        } else {
+            0
+        }
     }
 
     pub fn reduction_db(&self) -> f32 {
@@ -178,6 +209,8 @@ impl Engine {
             return;
         }
 
+        let eq_enabled = self.params.eq_enabled();
+
         for i in 0..MAX_BANDS {
             let b = &self.params.bands[i];
             let kind = b.kind.load(Ordering::Relaxed);
@@ -185,10 +218,18 @@ impl Engine {
             let gain = f32::from_bits(b.gain_db.load(Ordering::Relaxed));
             let q = f32::from_bits(b.q.load(Ordering::Relaxed));
 
-            let new = match kind {
-                KIND_LOW_SHELF => Biquad::low_shelf(self.sample_rate, freq, gain, q),
-                KIND_HIGH_SHELF => Biquad::high_shelf(self.sample_rate, freq, gain, q),
-                _ => Biquad::peaking(self.sample_rate, freq, gain, q),
+            // Flattening on disable is belt-and-braces: `presets::apply` already
+            // writes a unity curve for its flat preset, but making it happen here
+            // means a caller who clears the flag on its own still gets a bypass,
+            // rather than a chain quietly filtering with whatever curve was left.
+            let new = if eq_enabled {
+                match kind {
+                    KIND_LOW_SHELF => Biquad::low_shelf(self.sample_rate, freq, gain, q),
+                    KIND_HIGH_SHELF => Biquad::high_shelf(self.sample_rate, freq, gain, q),
+                    _ => Biquad::peaking(self.sample_rate, freq, gain, q),
+                }
+            } else {
+                Biquad::identity()
             };
             // Copy coefficients into every channel but keep each one's z1/z2:
             // swapping a filter out from under its own state is what makes
@@ -205,10 +246,8 @@ impl Engine {
         ));
         // Cheap enough to do on every parameter change: the module's filters are
         // fixed at construction, so this is one clamp and a multiply.
-        self.virtual_bass.set_amount(f32::from_bits(
-            self.params.virtual_bass.load(Ordering::Relaxed),
-        ));
-        self.enabled = self.params.enabled.load(Ordering::Relaxed);
+        self.virtual_bass
+            .set_amount(self.params.virtual_bass_amount());
 
         self.cached_version = v;
     }
@@ -217,8 +256,17 @@ impl Engine {
     pub fn process_i16(&mut self, buf: &mut [i16]) {
         self.refresh();
 
-        // True bypass: skip the limiter too, so an A/B comparison is honest.
-        if !self.enabled {
+        // Bypass means "nothing is being processed", which is what makes an A/B
+        // against it honest — no EQ, and the limiter's look-ahead drops out too, so
+        // the comparison is against *nothing* rather than against a re-levelled and
+        // delayed copy.
+        //
+        // Note this is a property of the whole chain, not of the EQ preset. The flat
+        // preset on its own is still a true bypass, but the flat preset with the
+        // virtual bass switched on is not: the bass *is* the processing. Gating on
+        // the preset number instead would make that combination silently inert, and
+        // it is the only way to hear the module by itself.
+        if !self.chain_is_active() {
             return;
         }
 
@@ -306,7 +354,7 @@ mod tests {
     #[test]
     fn disabled_engine_is_identity() {
         let mut e = Engine::new(48000.0, 2);
-        e.params.set_enabled(false);
+        e.params.set_eq_enabled(false);
         let mut buf = tone(4800, 440.0, 0.5, 48000.0);
         let before = buf.clone();
         e.process_i16(&mut buf);
@@ -402,34 +450,85 @@ mod tests {
     }
 
     /// The module is minimum-phase — filters and a memoryless shaper, no delay
-    /// line — so it must not move the chain's reported latency. The A/B in the UI
-    /// compares treated and untreated audio, and a latency change would be heard
-    /// as an echo rather than as a tone change.
+    /// line — so it adds no latency of its own.
+    ///
+    /// It does need the limiter to run, because the layer adds peak. What it must
+    /// not do is delay anything *beyond* that: the UI's A/B compares treated and
+    /// untreated audio, and a latency that grew with the amount would be heard as
+    /// an echo rather than as a tone change.
     #[test]
-    fn virtual_bass_adds_no_latency() {
-        let mut e = Engine::new(48000.0, 2);
-        let before = e.latency_frames();
+    fn virtual_bass_adds_no_latency_of_its_own() {
+        let e = Engine::new(48000.0, 2);
+        e.params.set_eq_enabled(false);
+        assert_eq!(e.latency_frames(), 0, "nothing running, nothing delayed");
+
+        e.params.set_virtual_bass(0.35);
+        let with_limiter = e.latency_frames();
+        assert!(
+            with_limiter > 0,
+            "the bass layer adds peak, so the limiter has to run"
+        );
+
         e.params.set_virtual_bass(1.0);
-        let mut buf = tone(4800, 60.0, 0.2, 48000.0);
-        e.process_i16(&mut buf);
-        assert_eq!(e.latency_frames(), before);
+        assert_eq!(
+            e.latency_frames(),
+            with_limiter,
+            "latency moved with the amount, so it is not coming from the limiter alone"
+        );
     }
 
-    /// Preset 0 is the honest control: it must silence the harmonic layer too, or
-    /// the A/B against it measures the virtual bass instead of the EQ.
+    /// Preset 0 is still the honest control for the EQ: with the bass off it is a
+    /// true bypass — no filtering, no limiter, bit-exact.
+    ///
+    /// What it must *not* be is a master switch. Gating the whole chain on the
+    /// preset number made "flat EQ + virtual bass" silently do nothing, and that
+    /// combination is the only way to hear the module on its own.
     #[test]
-    fn master_bypass_takes_virtual_bass_with_it() {
+    fn the_flat_preset_is_a_true_bypass_but_not_a_master_switch() {
         use crate::presets;
 
         let mut e = Engine::new(48000.0, 2);
-        e.params.set_virtual_bass(1.0);
         presets::apply(&e.params, 0);
+        let mut buf = tone(4800, 60.0, 0.2, 48000.0);
+        let before = buf.clone();
+        e.process_i16(&mut buf);
+        assert_eq!(buf, before, "flat preset with the bass off is not a bypass");
+        assert_eq!(e.latency_frames(), 0);
+
+        // Switching the bass on has to bring the module back, and only the module.
+        e.params.set_virtual_bass(1.0);
         let mut buf = tone(48_000, 60.0, 0.2, 48000.0);
         e.process_i16(&mut buf);
-        let level = level_db(&buf, 300.0);
+        let harmonics = level_db(&buf, 300.0);
+        println!("flat preset + bass on: 300 Hz at {harmonics:.1} dBFS");
         assert!(
-            level < -80.0,
-            "virtual bass survived the bypass: {level:.1} dBFS"
+            harmonics > -45.0,
+            "the bass module stayed inert: {harmonics:.1} dBFS"
+        );
+    }
+
+    /// With the bass on, the EQ filters still run — they have to, the harmonic
+    /// layer is added after them. So disabling the EQ has to make those filters
+    /// transparent, not merely make the preset number say they are.
+    #[test]
+    fn disabling_the_eq_leaves_no_curve_behind() {
+        let mut e = Engine::new(48000.0, 2);
+        e.params.set_band(0, KIND_PEAKING, 1000.0, 12.0, 1.0);
+        e.params.set_virtual_bass(1.0);
+
+        let mut buf = tone(48_000, 1000.0, 0.05, 48000.0);
+        e.process_i16(&mut buf);
+        let boosted = level_db(&buf, 1000.0);
+
+        e.params.set_eq_enabled(false);
+        let mut buf = tone(48_000, 1000.0, 0.05, 48000.0);
+        e.process_i16(&mut buf);
+        let flat = level_db(&buf, 1000.0);
+
+        println!("1 kHz: {boosted:.1} dBFS boosted, {flat:.1} dBFS after disabling the EQ");
+        assert!(
+            boosted - flat > 3.0,
+            "the boost survived disabling the EQ: {boosted:.1} -> {flat:.1} dBFS"
         );
     }
 

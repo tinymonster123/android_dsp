@@ -281,6 +281,7 @@ class CaptureService : Service() {
         if (engine.isValid) {
             applyPreset(engine, ProbeState.presetIndex, rec.sampleRate)
             engine.setVirtualBassLevel(ProbeState.virtualBassLevel)
+            republishLatency(engine, rec.sampleRate)
             // The curve tables live in Rust and the name tables in Kotlin; this is
             // the only place both are reachable at once.
             if (!Presets.namesMatchNative()) {
@@ -312,8 +313,20 @@ class CaptureService : Service() {
         ProbeState.presetIndex = idx
         ProbeState.presetName = info.name
         ProbeState.presetIntent = info.intent
-        ProbeState.dspLatencyMs = if (idx == 0) 0f else engine.latencyFrames * 1000f / sampleRate
+        republishLatency(engine, sampleRate)
         ProbeState.dspReductionDb = 0f
+    }
+
+    /**
+     * Republish the chain's latency, read from the engine rather than derived from
+     * the preset number.
+     *
+     * The chain runs while *either* the EQ or the virtual bass has work to do, so
+     * "preset 0 means zero latency" stopped being true the moment the bass module
+     * arrived — and the two controls are changed from different places.
+     */
+    private fun republishLatency(engine: DspEngine, sampleRate: Int) {
+        ProbeState.dspLatencyMs = engine.latencyFrames * 1000f / sampleRate
     }
 
     /** Called from the UI thread. */
@@ -347,7 +360,12 @@ class CaptureService : Service() {
         ProbeState.virtualBassLevel = idx
         ProbeState.virtualBassName = info.name
         ProbeState.virtualBassIntent = info.intent
-        dsp?.setVirtualBassLevel(idx)
+        // A null engine means no capture is running; the level is recorded and
+        // openInput() applies it when a record is opened.
+        dsp?.let { engine ->
+            engine.setVirtualBassLevel(idx)
+            republishLatency(engine, record?.sampleRate ?: 48000)
+        }
         ProbeState.note = "虚拟低音：${info.name}"
     }
 

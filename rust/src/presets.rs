@@ -112,8 +112,10 @@ pub fn apply(params: &Params, index: usize) {
     }
     params.set_output_gain_db(preset.output_gain_db);
     params.set_threshold_db(preset.threshold_db);
-    // Preset 0 is a true bypass: no EQ, and the limiter's latency drops out too.
-    params.set_enabled(index != 0);
+    // Preset 0 is a flat EQ, not a master switch. The virtual bass keeps its own
+    // setting across preset changes, so an A/B of the EQ does not silently turn the
+    // bass module off, and vice versa.
+    params.set_eq_enabled(index != 0);
 }
 
 #[cfg(test)]

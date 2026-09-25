@@ -51,8 +51,14 @@ class DspEngine(sampleRate: Int, channels: Int) : AutoCloseable {
         if (handle != 0L) nativeSetThresholdDb(handle, db)
     }
 
-    fun setEnabled(on: Boolean) {
-        if (handle != 0L) nativeSetEnabled(handle, on)
+    /**
+     * Turns the EQ off without touching the virtual bass.
+     *
+     * Not a master switch — the chain keeps running while the bass module has work
+     * to do, which is what lets the two be compared independently.
+     */
+    fun setEqEnabled(on: Boolean) {
+        if (handle != 0L) nativeSetEqEnabled(handle, on)
     }
 
     /**
@@ -99,7 +105,7 @@ class DspEngine(sampleRate: Int, channels: Int) : AutoCloseable {
         )
         @JvmStatic private external fun nativeSetOutputGainDb(handle: Long, db: Float)
         @JvmStatic private external fun nativeSetThresholdDb(handle: Long, db: Float)
-        @JvmStatic private external fun nativeSetEnabled(handle: Long, enabled: Boolean)
+        @JvmStatic private external fun nativeSetEqEnabled(handle: Long, enabled: Boolean)
         @JvmStatic private external fun nativeProcess(handle: Long, buf: ShortArray, length: Int)
         @JvmStatic private external fun nativeReductionDb(handle: Long): Float
         @JvmStatic private external fun nativeLatencyFrames(handle: Long): Int

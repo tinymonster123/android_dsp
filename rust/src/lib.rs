@@ -128,14 +128,14 @@ pub extern "system" fn Java_com_fenghanli_dspprobe_dsp_DspEngine_nativeSetThresh
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_fenghanli_dspprobe_dsp_DspEngine_nativeSetEnabled(
+pub extern "system" fn Java_com_fenghanli_dspprobe_dsp_DspEngine_nativeSetEqEnabled(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
     enabled: jboolean,
 ) {
     if let Some(h) = unsafe { handle_mut(handle) } {
-        h.engine.params.set_enabled(enabled != 0);
+        h.engine.params.set_eq_enabled(enabled != 0);
     }
 }
 
