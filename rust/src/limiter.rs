@@ -13,8 +13,14 @@
 /// Chosen over `tanh` because it is branch-simple and has no transcendentals, so
 /// it stays cheap on the audio thread. It is C1-continuous at the knee, which
 /// matters: a slope discontinuity there is audible as a buzz on transients.
+///
+/// Also used as the harmonic generator in [`crate::virtual_bass`], which needs a
+/// different property from the same curve: the shape is **odd-symmetric**, so it
+/// produces only odd harmonics, which is what keeps a reconstructed bass at its
+/// original pitch instead of an octave up. Sharing one implementation keeps the
+/// two from drifting; if either ever needs a different curve, split it then.
 #[inline]
-fn soft_clip(x: f32) -> f32 {
+pub(crate) fn soft_clip(x: f32) -> f32 {
     let a = x.abs();
     if a <= 0.5 {
         x

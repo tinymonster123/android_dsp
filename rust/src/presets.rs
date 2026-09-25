@@ -166,7 +166,9 @@ mod tests {
     /// `cargo test --manifest-path rust/Cargo.toml print_response_table -- --nocapture`
     #[test]
     fn print_response_table() {
-        const FREQS: [f32; 11] = [60.0, 120.0, 250.0, 500.0, 1000.0, 1600.0, 2500.0, 3200.0, 6000.0, 10000.0, 14000.0];
+        const FREQS: [f32; 11] = [
+            60.0, 120.0, 250.0, 500.0, 1000.0, 1600.0, 2500.0, 3200.0, 6000.0, 10000.0, 14000.0,
+        ];
 
         print!("\n{:>9}", "Hz");
         for i in 0..PRESETS.len() {
@@ -216,7 +218,10 @@ mod tests {
         );
         // The previous version shelved the top down, which is what made it sound
         // thin rather than clear.
-        assert!(air > -0.5, "the top must not be dulled, measured {air:.1} dB");
+        assert!(
+            air > -0.5,
+            "the top must not be dulled, measured {air:.1} dB"
+        );
         assert!(
             presence - bass > 5.0,
             "the mid/bass tilt is the whole point: {presence:.1} vs {bass:.1} dB"
@@ -231,13 +236,19 @@ mod tests {
         let air = gain_db(2, 12000.0);
 
         assert!(bass > 3.0, "bass should be lifted, measured {bass:.1} dB");
-        assert!(vocal_band < -3.0, "the vocal band should be scooped, measured {vocal_band:.1} dB");
+        assert!(
+            vocal_band < -3.0,
+            "the vocal band should be scooped, measured {vocal_band:.1} dB"
+        );
         assert!(air > 3.0, "air should be lifted, measured {air:.1} dB");
 
         // The point of keeping both is that they are audibly different, so the
         // gap between them has to be large at the vocal band.
         let gap = gain_db(1, 1200.0) - gain_db(2, 1200.0);
-        assert!(gap > 6.0, "presets 1 and 2 are too similar at 1.2 kHz: {gap:.1} dB apart");
+        assert!(
+            gap > 6.0,
+            "presets 1 and 2 are too similar at 1.2 kHz: {gap:.1} dB apart"
+        );
     }
 
     /// Preset 3 is preset 4 at a third of the amount; the ordering must hold.

@@ -20,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import com.fenghanli.dspprobe.dsp.Presets
+import com.fenghanli.dspprobe.dsp.VirtualBass
 
 class MainActivity : Activity() {
 
@@ -37,6 +38,8 @@ class MainActivity : Activity() {
     private lateinit var muteBtn: Button
     private lateinit var presetBtn: Button
     private lateinit var presetInfoText: TextView
+    private lateinit var virtualBassBtn: Button
+    private lateinit var virtualBassInfoText: TextView
 
     private val ui = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
@@ -130,6 +133,23 @@ class MainActivity : Activity() {
         }
         root.addView(presetInfoText, matchWidth())
 
+        virtualBassBtn = Button(this).apply {
+            setOnClickListener {
+                service()?.setVirtualBassLevel(
+                    (ProbeState.virtualBassLevel + 1) % VirtualBass.count()
+                )
+            }
+        }
+        root.addView(virtualBassBtn, matchWidth())
+
+        virtualBassInfoText = TextView(this).apply {
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#555555"))
+            setPadding(0, 0, 0, dp(6))
+        }
+        root.addView(virtualBassInfoText, matchWidth())
+
         stopBtn = Button(this).apply {
             text = "停止"
             setOnClickListener {
@@ -170,6 +190,7 @@ class MainActivity : Activity() {
         routeBtn.isEnabled = ProbeState.running
         muteBtn.isEnabled = ProbeState.running
         presetBtn.isEnabled = ProbeState.running
+        virtualBassBtn.isEnabled = ProbeState.running
 
         playbackBtn.text =
             if (ProbeState.playing) "2. 回放：开（听有没有回声）" else "2. 回放：关（听原声还在不在）"
@@ -178,6 +199,8 @@ class MainActivity : Activity() {
             if (ProbeState.muteOriginal) "4. 静音原声：开（只剩我们一路）" else "4. 静音原声：关"
         presetBtn.text = "5. DSP：${ProbeState.presetName}（点一下换）"
         presetInfoText.text = ProbeState.presetIntent
+        virtualBassBtn.text = "6. 虚拟低音：${ProbeState.virtualBassName}（点一下换）"
+        virtualBassInfoText.text = ProbeState.virtualBassIntent
 
         when (ProbeState.verdict()) {
             ProbeState.Verdict.IDLE -> {

@@ -32,6 +32,17 @@ class DspEngine(sampleRate: Int, channels: Int) : AutoCloseable {
         if (handle != 0L) nativeApplyPreset(handle, index)
     }
 
+    /**
+     * Applies a virtual-bass step defined in Rust.
+     *
+     * Takes a step index rather than a level: the amount behind each step is a DSP
+     * parameter and lives in `rust/src/virtual_bass.rs`, which is also where a test
+     * checks that every step does something and that they ascend.
+     */
+    fun setVirtualBassLevel(index: Int) {
+        if (handle != 0L) nativeSetVirtualBassLevel(handle, index)
+    }
+
     fun setOutputGainDb(db: Float) {
         if (handle != 0L) nativeSetOutputGainDb(handle, db)
     }
@@ -70,6 +81,9 @@ class DspEngine(sampleRate: Int, channels: Int) : AutoCloseable {
         /** How many curves the native side has. Use this rather than a literal. */
         val presetCount: Int get() = nativePresetCount()
 
+        /** How many virtual-bass steps the native side has. */
+        val virtualBassLevelCount: Int get() = nativeVirtualBassLevelCount()
+
         init {
             System.loadLibrary("dsp")
         }
@@ -78,6 +92,8 @@ class DspEngine(sampleRate: Int, channels: Int) : AutoCloseable {
         @JvmStatic private external fun nativeDestroy(handle: Long)
         @JvmStatic private external fun nativeApplyPreset(handle: Long, index: Int)
         @JvmStatic private external fun nativePresetCount(): Int
+        @JvmStatic private external fun nativeSetVirtualBassLevel(handle: Long, index: Int)
+        @JvmStatic private external fun nativeVirtualBassLevelCount(): Int
         @JvmStatic private external fun nativeSetBand(
             handle: Long, index: Int, kind: Int, freqHz: Float, gainDb: Float, q: Float
         )

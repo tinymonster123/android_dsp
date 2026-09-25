@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::biquad::Biquad;
 use crate::limiter::Limiter;
+use crate::virtual_bass::VirtualBass;
 
 pub const MAX_BANDS: usize = 10;
 pub const MAX_CHANNELS: usize = 2;
@@ -50,6 +51,7 @@ pub struct Params {
     bands: [BandParams; MAX_BANDS],
     output_gain_db: AtomicU32,
     threshold_db: AtomicU32,
+    virtual_bass: AtomicU32,
     enabled: AtomicBool,
 }
 
@@ -63,6 +65,7 @@ impl Params {
             // Parenthesised on purpose: `-1.0f32.to_bits()` parses as
             // `-(1.0f32.to_bits())`, i.e. unary minus on a u32.
             threshold_db: AtomicU32::new((-1.0f32).to_bits()),
+            virtual_bass: AtomicU32::new(0.0f32.to_bits()),
             enabled: AtomicBool::new(true),
         }
     }
@@ -94,6 +97,16 @@ impl Params {
         self.bump();
     }
 
+    /// 0..1, where 0 bypasses the virtual-bass module entirely.
+    ///
+    /// Deliberately separate from the preset table: the harmonic layer and the EQ
+    /// curve answer different questions, and a user who wants a bass lift should
+    /// not have to give up the curve they picked.
+    pub fn set_virtual_bass(&self, amount: f32) {
+        self.virtual_bass.store(amount.to_bits(), Ordering::Relaxed);
+        self.bump();
+    }
+
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
         self.bump();
@@ -115,6 +128,7 @@ pub struct Engine {
     /// interleaved L/R/R would run every section at twice the real sample rate,
     /// which detunes the whole EQ — a filter centred on 1 kHz lands on 500 Hz.
     filters: [[Biquad; MAX_BANDS]; MAX_CHANNELS],
+    virtual_bass: VirtualBass,
     limiter: Limiter,
 
     cached_version: u32,
@@ -134,6 +148,7 @@ impl Engine {
             channels,
             params: Params::new(),
             filters,
+            virtual_bass: VirtualBass::new(sample_rate, channels),
             limiter: Limiter::new(sample_rate, channels, -1.0, 2.0),
             // u32::MAX can never be a real version, so the first process() always refreshes.
             cached_version: u32::MAX,
@@ -185,8 +200,14 @@ impl Engine {
 
         self.target_gain =
             10f32.powf(f32::from_bits(self.params.output_gain_db.load(Ordering::Relaxed)) / 20.0);
-        self.limiter
-            .set_threshold_db(f32::from_bits(self.params.threshold_db.load(Ordering::Relaxed)));
+        self.limiter.set_threshold_db(f32::from_bits(
+            self.params.threshold_db.load(Ordering::Relaxed),
+        ));
+        // Cheap enough to do on every parameter change: the module's filters are
+        // fixed at construction, so this is one clamp and a multiply.
+        self.virtual_bass.set_amount(f32::from_bits(
+            self.params.virtual_bass.load(Ordering::Relaxed),
+        ));
         self.enabled = self.params.enabled.load(Ordering::Relaxed);
 
         self.cached_version = v;
@@ -227,6 +248,10 @@ impl Engine {
                 frame[c] = x;
             }
 
+            // After the EQ so a user's bass cut also calms the harmonic generator
+            // (one control, two effects, in the direction they asked for), and
+            // before the limiter so the layer's extra peak is accounted for.
+            self.virtual_bass.process_frame(&mut frame[..ch]);
             self.limiter.process_frame(&mut frame[..ch]);
 
             for c in 0..ch {
@@ -259,6 +284,25 @@ mod tests {
             .collect()
     }
 
+    /// Level of `freq` in channel 0, in dBFS, over the second half of `buf`.
+    ///
+    /// A single-bin DFT, as in the virtual-bass tests: half a second of any
+    /// multiple of 2 Hz is a whole number of periods, so there is no leakage.
+    fn level_db(buf: &[i16], freq: f32) -> f32 {
+        let frames = buf.len() / 2;
+        let start = frames / 2;
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for i in start..frames {
+            let x = buf[i * 2] as f64 / 32768.0;
+            let w = 2.0 * std::f64::consts::PI * freq as f64 * (i - start) as f64 / 48000.0;
+            re += x * w.cos();
+            im -= x * w.sin();
+        }
+        let n = (frames - start) as f64;
+        let amp = (2.0 * (re * re + im * im).sqrt() / n) as f32;
+        20.0 * amp.max(1e-9).log10()
+    }
+
     #[test]
     fn disabled_engine_is_identity() {
         let mut e = Engine::new(48000.0, 2);
@@ -277,7 +321,10 @@ mod tests {
         let mut buf = tone(48000, 1000.0, 0.2, 48000.0);
         e.process_i16(&mut buf);
         let out = rms(&buf[1000..]);
-        assert!(out > 0.2 * 32767.0 * 1.5, "boost did not raise level: {out}");
+        assert!(
+            out > 0.2 * 32767.0 * 1.5,
+            "boost did not raise level: {out}"
+        );
     }
 
     /// Even a crazy boost must not clip once the limiter is in the chain.
@@ -319,7 +366,71 @@ mod tests {
             .map(|v| (*v as i32).abs())
             .max()
             .unwrap();
-        assert_eq!(right_peak, 0, "tone bled into the silent channel: {right_peak}");
+        assert_eq!(
+            right_peak, 0,
+            "tone bled into the silent channel: {right_peak}"
+        );
+    }
+
+    /// The module measures itself in isolation; this checks the thing those tests
+    /// cannot — that it is actually plugged into the chain, and that it still
+    /// works after the EQ and into the limiter.
+    #[test]
+    fn virtual_bass_is_wired_into_the_chain() {
+        let with = {
+            let mut e = Engine::new(48000.0, 2);
+            e.params.set_virtual_bass(1.0);
+            let mut buf = tone(48_000, 60.0, 0.2, 48000.0);
+            e.process_i16(&mut buf);
+            level_db(&buf, 300.0)
+        };
+        let without = {
+            let mut e = Engine::new(48000.0, 2);
+            let mut buf = tone(48_000, 60.0, 0.2, 48000.0);
+            e.process_i16(&mut buf);
+            level_db(&buf, 300.0)
+        };
+        println!("300 Hz: {without:.1} dBFS without, {with:.1} dBFS with");
+        assert!(
+            with > -45.0,
+            "no usable harmonic reached the output: {with:.1} dBFS"
+        );
+        assert!(
+            with > without + 30.0,
+            "the module is present but doing nothing: {without:.1} -> {with:.1} dBFS"
+        );
+    }
+
+    /// The module is minimum-phase — filters and a memoryless shaper, no delay
+    /// line — so it must not move the chain's reported latency. The A/B in the UI
+    /// compares treated and untreated audio, and a latency change would be heard
+    /// as an echo rather than as a tone change.
+    #[test]
+    fn virtual_bass_adds_no_latency() {
+        let mut e = Engine::new(48000.0, 2);
+        let before = e.latency_frames();
+        e.params.set_virtual_bass(1.0);
+        let mut buf = tone(4800, 60.0, 0.2, 48000.0);
+        e.process_i16(&mut buf);
+        assert_eq!(e.latency_frames(), before);
+    }
+
+    /// Preset 0 is the honest control: it must silence the harmonic layer too, or
+    /// the A/B against it measures the virtual bass instead of the EQ.
+    #[test]
+    fn master_bypass_takes_virtual_bass_with_it() {
+        use crate::presets;
+
+        let mut e = Engine::new(48000.0, 2);
+        e.params.set_virtual_bass(1.0);
+        presets::apply(&e.params, 0);
+        let mut buf = tone(48_000, 60.0, 0.2, 48000.0);
+        e.process_i16(&mut buf);
+        let level = level_db(&buf, 300.0);
+        assert!(
+            level < -80.0,
+            "virtual bass survived the bypass: {level:.1} dBFS"
+        );
     }
 
     #[test]
@@ -334,6 +445,9 @@ mod tests {
         let mut next = tone(480, 1000.0, 0.3, 48000.0);
         e.process_i16(&mut next);
         let first = next[0].abs() as f32;
-        assert!(first < 12000.0, "discontinuity after parameter change: {first}");
+        assert!(
+            first < 12000.0,
+            "discontinuity after parameter change: {first}"
+        );
     }
 }

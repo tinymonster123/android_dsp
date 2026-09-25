@@ -22,6 +22,7 @@ pub mod biquad;
 pub mod engine;
 pub mod limiter;
 pub mod presets;
+pub mod virtual_bass;
 
 use jni::objects::{JClass, JShortArray};
 use jni::sys::{jboolean, jfloat, jint, jlong};
@@ -189,6 +190,31 @@ pub extern "system" fn Java_com_fenghanli_dspprobe_dsp_DspEngine_nativeApplyPres
     if let Some(h) = unsafe { handle_mut(handle) } {
         presets::apply(&h.engine.params, index.max(0) as usize);
     }
+}
+
+/// Applies virtual-bass step `index`. The step's `amount` lives in
+/// [`virtual_bass::LEVELS`], so Kotlin never handles the number.
+#[no_mangle]
+pub extern "system" fn Java_com_fenghanli_dspprobe_dsp_DspEngine_nativeSetVirtualBassLevel(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    index: jint,
+) {
+    if let Some(h) = unsafe { handle_mut(handle) } {
+        let amount = virtual_bass::level_amount(index.max(0) as usize);
+        h.engine.params.set_virtual_bass(amount);
+    }
+}
+
+/// Number of virtual-bass steps. Same contract as `nativePresetCount`: Kotlin
+/// keeps the names and checks its table against this.
+#[no_mangle]
+pub extern "system" fn Java_com_fenghanli_dspprobe_dsp_DspEngine_nativeVirtualBassLevelCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    virtual_bass::level_count() as jint
 }
 
 /// Number of curves the native side knows about. Kotlin keeps the display names

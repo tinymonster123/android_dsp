@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
@@ -27,6 +28,7 @@ import android.os.Process
 import android.util.Log
 import com.fenghanli.dspprobe.dsp.DspEngine
 import com.fenghanli.dspprobe.dsp.Presets
+import com.fenghanli.dspprobe.dsp.VirtualBass
 import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlin.math.log10
@@ -90,6 +92,14 @@ class CaptureService : Service() {
     private val outputTimestamp = AudioTimestamp()
 
     private var savedMusicVolume = -1
+
+    /**
+     * Original volume per output route, -1 meaning "not captured".
+     *
+     * Fixed-size and allocated up front because route changes can be realised on
+     * the audio thread, where allocating is not allowed.
+     */
+    private val savedRouteVolume = IntArray(3) { -1 }
 
     @Volatile
     private var loopRunning = false
@@ -219,6 +229,7 @@ class CaptureService : Service() {
                 ProbeState.nativeFramesPerBuffer * 1000f / ProbeState.nativeSampleRate
         }
         ProbeState.musicVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        ProbeState.routeVolume = am.getStreamVolume(streamForRoute(ProbeState.outputRoute))
 
         if (!openInput(proj)) return
         openOutput()
@@ -269,11 +280,17 @@ class CaptureService : Service() {
         dsp = engine
         if (engine.isValid) {
             applyPreset(engine, ProbeState.presetIndex, rec.sampleRate)
-            // The curve table lives in Rust and the name table in Kotlin; this is
+            engine.setVirtualBassLevel(ProbeState.virtualBassLevel)
+            // The curve tables live in Rust and the name tables in Kotlin; this is
             // the only place both are reachable at once.
             if (!Presets.namesMatchNative()) {
                 ProbeState.note =
                     "预设表不一致：Kotlin ${Presets.count()} 条 vs native ${DspEngine.presetCount} 条"
+            }
+            if (!VirtualBass.namesMatchNative()) {
+                ProbeState.note =
+                    "虚拟低音表不一致：Kotlin ${VirtualBass.count()} 档 vs native " +
+                        "${DspEngine.virtualBassLevelCount} 档"
             }
         } else {
             ProbeState.note = "DSP 引擎创建失败（libdsp.so 没加载上？）"
@@ -314,6 +331,24 @@ class CaptureService : Service() {
         }
         applyPreset(engine, idx, record?.sampleRate ?: 48000)
         ProbeState.note = "DSP 预设：${Presets.infoAt(idx).name}"
+    }
+
+    /**
+     * Called from the UI thread.
+     *
+     * Deliberately orthogonal to the EQ preset: the harmonic layer and the curve
+     * answer different questions, and wanting more low end should not mean giving
+     * up the curve that was just chosen. The two only interact at preset 0, which
+     * is a true bypass of the whole chain including this module.
+     */
+    fun setVirtualBassLevel(index: Int) {
+        val idx = index.coerceIn(0, VirtualBass.count() - 1)
+        val info = VirtualBass.infoAt(idx)
+        ProbeState.virtualBassLevel = idx
+        ProbeState.virtualBassName = info.name
+        ProbeState.virtualBassIntent = info.intent
+        dsp?.setVirtualBassLevel(idx)
+        ProbeState.note = "虚拟低音：${info.name}"
     }
 
     /**
@@ -382,6 +417,53 @@ class CaptureService : Service() {
         track = t
         ProbeState.hasTrack = t != null
         ProbeState.outputPolicy = t?.audioAttributes?.allowedCapturePolicy ?: -1
+        preferBluetoothSink(t)
+    }
+
+    /**
+     * Asks the track to prefer the Bluetooth sink.
+     *
+     * Stream routing policy decides which streams *may* play; this decides which
+     * device *this track* goes to. On this ROM `USAGE_ALARM` is routed to the
+     * phone speaker and A2DP at once — which makes headphone listening impossible —
+     * and setPreferredDevice is the supported way to say "this track, that device".
+     * It is a request, not a guarantee, which is why the actual result is read
+     * back from the track and shown in the readout.
+     */
+    private fun preferBluetoothSink(t: AudioTrack?) {
+        if (t == null) {
+            ProbeState.preferredDevice = "-"
+            return
+        }
+        val am = getSystemService(AudioManager::class.java)
+        val bt = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
+        if (bt == null) {
+            ProbeState.preferredDevice = "(没有蓝牙输出设备)"
+            return
+        }
+        // Called as a method, not via the property: the property setter throws
+        // away setPreferredDevice's boolean, and that boolean is the whole answer.
+        @Suppress("UsePropertyAccessSyntax")
+        val accepted = try {
+            t.setPreferredDevice(bt)
+        } catch (e: Throwable) {
+            ProbeState.preferredDevice = "异常 ${e.javaClass.simpleName}"
+            return
+        }
+        ProbeState.preferredDevice =
+            if (accepted) "→ ${bt.productName}" else "被拒绝 (${bt.productName})"
+    }
+
+    /** Human-readable name for an [AudioDeviceInfo] type. */
+    private fun deviceTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "bt_a2dp"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bt_sco"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "usb"
+        else -> "type$type"
     }
 
     private fun releaseTrack() {
@@ -411,10 +493,65 @@ class CaptureService : Service() {
     fun cycleOutputRoute() {
         val next = (ProbeState.outputRoute + 1) % 3
         ProbeState.outputRoute = next
+        // Volume bookkeeping is a binder call, so it stays on this thread: the
+        // audio thread must not block or allocate.
+        ensureRouteAudible(next)
         if (loopRunning) {
             pendingRoute = next
         } else {
             realizeRoute(next)
+        }
+    }
+
+    /** Which system stream a route's output lands on. */
+    private fun streamForRoute(route: Int): Int = when (route) {
+        1 -> AudioManager.STREAM_ALARM
+        2 -> AudioManager.STREAM_SYSTEM
+        else -> AudioManager.STREAM_MUSIC
+    }
+
+    /**
+     * Makes sure the stream our output lands on is actually audible.
+     *
+     * The threshold is deliberately not zero. Our output track is the active one
+     * on its stream, so the hardware volume keys adjust *that* stream — a user
+     * reaching for "the volume" silently turns our own output down to 1 and then
+     * reports "no sound". Treating anything below a third of full scale as a
+     * silent route turns a confusing dead end into a self-correcting one.
+     */
+    private fun ensureRouteAudible(route: Int) {
+        val stream = streamForRoute(route)
+        val am = getSystemService(AudioManager::class.java)
+        val current = am.getStreamVolume(stream)
+        val max = am.getStreamMaxVolume(stream)
+        ProbeState.routeVolume = current
+
+        val floor = (max * 0.3f).toInt().coerceAtLeast(1)
+        if (current >= floor) return
+
+        if (savedRouteVolume[route] < 0) savedRouteVolume[route] = current
+        val target = (max * 0.7f).toInt().coerceAtLeast(1)
+        try {
+            am.setStreamVolume(stream, target, 0)
+            ProbeState.routeVolume = am.getStreamVolume(stream)
+            ProbeState.note =
+                "${ProbeState.routeName(route)} 音量 $current/$max 太低，已提到 ${ProbeState.routeVolume}"
+        } catch (e: Throwable) {
+            ProbeState.note = "提 ${ProbeState.routeName(route)} 音量被拒: ${e.javaClass.simpleName}"
+        }
+    }
+
+    /** Puts back every stream volume this service moved. */
+    private fun restoreRouteVolumes() {
+        for (route in savedRouteVolume.indices) {
+            val original = savedRouteVolume[route]
+            if (original < 0) continue
+            try {
+                getSystemService(AudioManager::class.java)
+                    .setStreamVolume(streamForRoute(route), original, 0)
+            } catch (_: Throwable) {
+            }
+            savedRouteVolume[route] = -1
         }
     }
 
@@ -592,6 +729,10 @@ class CaptureService : Service() {
                     if (written < 0) ProbeState.trackUnderruns++
                     if (iteration % 20 == 0) {
                         ProbeState.dspReductionDb = dsp?.reductionDb ?: 0f
+                        // Read back where the track actually went; setPreferredDevice
+                        // is only a request, so this is the real answer.
+                        ProbeState.routedDevice =
+                            t.routedDevice?.let { deviceTypeName(it.type) } ?: "-"
                         if (t.getTimestamp(outputTimestamp)) {
                             // nanoTime is on the same monotonic clock as System.nanoTime(),
                             // so this is how long ago the presented frame reached the device.
@@ -613,7 +754,7 @@ class CaptureService : Service() {
         ProbeState.running = false
         ProbeState.playing = false
 
-        // Never leave the user's phone with the media stream muted.
+        // Never leave the user's phone with a stream left muted or cranked.
         if (ProbeState.muteOriginal) {
             try {
                 val am = getSystemService(AudioManager::class.java)
@@ -627,6 +768,7 @@ class CaptureService : Service() {
             }
             ProbeState.muteOriginal = false
         }
+        restoreRouteVolumes()
 
         // Stopping the record unblocks a read() that the worker is parked in, so this must
         // happen before we join it.

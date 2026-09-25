@@ -37,6 +37,18 @@ object ProbeState {
     /** One line describing what the current curve is meant to do. */
     @Volatile var presetIntent = "直通"
 
+    /**
+     * Index into [com.fenghanli.dspprobe.dsp.VirtualBass.ALL].
+     *
+     * Kept as an index rather than an amount because the amount is a DSP parameter
+     * that lives on the Rust side; only the step number crosses the boundary.
+     */
+    @Volatile var virtualBassLevel = 0
+    @Volatile var virtualBassName = "关"
+
+    /** One line describing what the current virtual-bass step is meant to do. */
+    @Volatile var virtualBassIntent = "直通"
+
     /** Gain reduction the limiter is currently applying, in dB. 0 means idle. */
     @Volatile var dspReductionDb = 0f
 
@@ -72,6 +84,15 @@ object ProbeState {
 
     /** STREAM_MUSIC volume as the system reports it right now. */
     @Volatile var musicVolume = -1
+
+    /** Volume of the stream our output is currently landing on. */
+    @Volatile var routeVolume = -1
+
+    /** Result of asking the track to prefer the Bluetooth sink. */
+    @Volatile var preferredDevice = "-"
+
+    /** Where the output track actually ended up, read back from the track itself. */
+    @Volatile var routedDevice = "-"
 
     /** Duration of one capture chunk, i.e. the pipeline's base quantum. */
     @Volatile var chunkMs = 0f
@@ -127,14 +148,17 @@ object ProbeState {
         appendLine("device mix  ${nativeSampleRate}Hz, ${nativeFramesPerBuffer} frames/burst (%.1f ms)".format(nativeBurstMs))
         appendLine("chunk       %.1f ms   <- our read granularity".format(chunkMs))
         appendLine()
-        appendLine("playback    ${if (playing) "ON" else "OFF"}  → ${routeName(outputRoute)}")
+        appendLine("playback    ${if (playing) "ON" else "OFF"}  → ${routeName(outputRoute)} vol=$routeVolume")
         appendLine("out track   ${if (hasTrack) "OK" else "MISSING"}   policy=${policyName(outputPolicy)} (1=ALL 2=SYSTEM 3=NONE)")
+        appendLine("bpref       $preferredDevice")
+        appendLine("routed      $routedDevice")
         appendLine("out lag     ${trackLatencyMs} ms  (AudioTrack getTimestamp)")
         appendLine("added delay %.1f - %.1f ms".format(addedLatencyMsLo, addedLatencyMsHi))
         appendLine("underruns   $trackUnderruns")
         appendLine()
         appendLine("mute orig   ${if (muteOriginal) "ON" else "OFF"}   STREAM_MUSIC vol=$musicVolume")
         appendLine("dsp         $presetName — $presetIntent")
+        appendLine("virt bass   $virtualBassName — $virtualBassIntent")
         appendLine("            latency %.1f ms, GR %.1f dB".format(dspLatencyMs, dspReductionDb))
         appendLine("read errors $readErrors (last $lastReadError)")
         if (note.isNotEmpty()) appendLine("note        $note")
